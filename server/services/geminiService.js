@@ -1,6 +1,15 @@
-import { GoogleGenAI, Type } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+import { GoogleGenAI, Type } from "@google/genai";
+import OpenAI from "openai";
+
+const ai = new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+});
+
+const openrouter = new OpenAI({
+    baseURL: "https://openrouter.ai/api/v1",
+    apiKey: process.env.OPENROUTER_API_KEY,
+});
 
 const seoAnalysisSchema = {
     type: Type.OBJECT,
@@ -14,7 +23,9 @@ const seoAnalysisSchema = {
                 accessibility: { type: Type.INTEGER },
                 bestPractices: { type: Type.INTEGER },
             },
-            required: ["seo", "performance", "accessibility", "bestPractices"],
+            required: [
+                "seo", "performance", "accessibility", "bestPractices",
+            ],
         },
         keywords: {
             type: Type.ARRAY,
@@ -35,95 +46,196 @@ const seoAnalysisSchema = {
                 properties: {
                     severity: {
                         type: Type.STRING,
-                        format: "enum",
                         enum: ["critical", "warning", "info"],
                     },
-
                     category: { type: Type.STRING },
                     message: { type: Type.STRING },
                     recommendation: { type: Type.STRING },
                 },
-                required: ["severity", "category", "message", "recommendation"],
+                required: [
+                    "severity", "category", "message", "recommendation",
+                ],
             },
         },
     },
     required: ["overallScore", "categories", "keywords", "issues"],
 };
 
+const schemaForPrompt = JSON.stringify(seoAnalysisSchema);
+
+function buildPrompt(scrapedData) {
+    const meta = scrapedData.metaData || {};
+    const headings = scrapedData.headings || {};
+    const links = scrapedData.links || {};
+    const images = scrapedData.images || {};
+
+    return `You are an expert SEO analyst. Analyze the website data below.
+
+URL: ${scrapedData.url}
+Load time: ${scrapedData.loadTime}ms
+Status code: ${scrapedData.statusCode}
+Page size: ${Math.round((scrapedData.pageSize || 0) / 1024)}KB
+Word count: ${scrapedData.wordCount}
+
+META DATA:
+${JSON.stringify(meta)}
+
+HEADINGS:
+${JSON.stringify(headings)}
+
+LINKS:
+${JSON.stringify(links)}
+
+IMAGES:
+${JSON.stringify(images)}
+
+PAGE CONTENT (first 3000 characters):
+${String(scrapedData.bodyText || "").slice(0, 3000)}
+
+Scoring guidelines:
+- Title: ideally 50-60 characters and must exist.
+- Description: ideally 150-160 characters and must exist.
+- Exactly one H1 is ideal.
+- Images should have alt text.
+- Load time under 3 seconds is good; under 5 seconds is acceptable.
+- Page size under 3MB is good.
+- Check viewport, charset, canonical, social tags, internal links,
+  word count, and heading hierarchy.
+- Return 5-15 actionable issues, critical issues first.
+- Severity must be critical, warning, or info.
+- Include up to 10 keywords ranked by frequency.
+
+Return ONLY valid JSON matching this structure:
+${schemaForPrompt}`;
+}
+
+function validateAnalysis(data) {
+    if (
+        !data ||
+        !Number.isInteger(data.overallScore) ||
+        !data.categories ||
+        !Array.isArray(data.keywords) ||
+        !Array.isArray(data.issues)
+    ) {
+        throw new Error("AI response does not match the expected SEO format.");
+    }
+
+    const categoryNames = [
+        "seo", "performance", "accessibility", "bestPractices",
+    ];
+
+    for (const name of categoryNames) {
+        if (!Number.isInteger(data.categories[name])) {
+            throw new Error(`AI response is missing category: ${name}`);
+        }
+    }
+
+    for (const issue of data.issues) {
+        if (
+            !["critical", "warning", "info"].includes(issue.severity) ||
+            typeof issue.category !== "string" ||
+            typeof issue.message !== "string" ||
+            typeof issue.recommendation !== "string"
+        ) {
+            throw new Error("AI response contains an invalid SEO issue.");
+        }
+    }
+
+    for (const keyword of data.keywords) {
+        if (
+            typeof keyword.word !== "string" ||
+            !Number.isInteger(keyword.count) ||
+            typeof keyword.density !== "number"
+        ) {
+            throw new Error("AI response contains an invalid keyword.");
+        }
+    }
+
+    return data;
+}
+
+async function analyzeWithOpenRouter(prompt) {
+    if (!process.env.OPENROUTER_API_KEY) {
+        throw new Error("OPENROUTER_API_KEY is not configured.");
+    }
+
+    // Use a model currently available to your OpenRouter account.
+    // Change this ID if your selected model uses a different identifier.
+    const model = "google/gemini-2.5-flash";
+
+    const response = await openrouter.chat.completions.create({
+    model,
+    messages: [
+        {
+            role: "system",
+            content: "You are an SEO analyst. Return only valid JSON.",
+        },
+        { role: "user", content: prompt },
+    ],
+    max_tokens: 4000,
+    response_format: { type: "json_object" },
+});
+
+    const content = response.choices?.[0]?.message?.content;
+
+    if (!content) {
+        throw new Error("OpenRouter returned an empty response.");
+    }
+
+    return validateAnalysis(JSON.parse(content));
+}
+
 export async function analyzeSeoData(scrapedData) {
+    const prompt = buildPrompt(scrapedData);
+    const models = [
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+    ];
+
+    let lastError;
+
+    for (const model of models) {
+        try {
+            console.log(`Trying Gemini model: ${model}`);
+
+            const response = await ai.models.generateContent({
+                model,
+                contents: prompt,
+                config: {
+                    responseMimeType: "application/json",
+                    responseSchema: seoAnalysisSchema,
+                },
+            });
+
+            if (!response.text) {
+                throw new Error("Gemini returned an empty response.");
+            }
+
+            const analysis = validateAnalysis(JSON.parse(response.text));
+            console.log(`SEO analysis succeeded with ${model}`);
+
+            return { success: true, data: analysis };
+        } catch (error) {
+            lastError = error;
+            console.error(`Gemini ${model} failed:`, error.message);
+        }
+    }
+
+    console.warn("Gemini models failed. Trying OpenRouter fallback.");
+
     try {
-        const prompt = `You are an expert SEO analyst. Analyze the following website data and provide a comprehensive SEO audit.
-
-        Website URL: ${scrapedData.url}
-        Load Time: ${scrapedData.loadTime}ms
-        Status Code: ${scrapedData.statusCode}
-        Page Size: ${Math.round(scrapedData.pageSize / 1024)}KB
-        Word Count: ${scrapedData.wordCount}
-
-        META DATA:
-        - Title: "${scrapedData.metaData.title}" (${scrapedData.metaData.title.length} chars)
-        - Description: "${scrapedData.metaData.description}" (${scrapedData.metaData.description.length} chars)
-        - Canonical: "${scrapedData.metaData.canonical}"
-        - Robots: "${scrapedData.metaData.robots}"
-        - OG Title: "${scrapedData.metaData.ogTitle}"
-        - OG Description: "${scrapedData.metaData.ogDescription}"
-        - OG Image: "${scrapedData.metaData.ogImage}"
-        - Twitter Card: "${scrapedData.metaData.twitterCard}"
-        - Viewport: "${scrapedData.metaData.viewport}"
-        - Charset: "${scrapedData.metaData.charset}"
-
-        HEADINGS:
-        - H1: ${scrapedData.headings.h1} (texts: ${JSON.stringify(scrapedData.headings.h1Texts)})
-        - H2: ${scrapedData.headings.h2}
-        - H3: ${scrapedData.headings.h3}
-        - H4: ${scrapedData.headings.h4}
-        - H5: ${scrapedData.headings.h5}
-        - H6: ${scrapedData.headings.h6}
-
-        LINKS:
-        - Internal: ${scrapedData.links.internal}
-        - External: ${scrapedData.links.external}
-        - Total: ${scrapedData.links.total}
-
-        IMAGES:
-        - Total: ${scrapedData.images.total}
-        - Missing Alt Text: ${scrapedData.images.missingAlt}
-        - With Alt Text: ${scrapedData.images.withAlt}
-
-        PAGE CONTENT (first 3000 chars):
-        ${scrapedData.bodyText}
-
-        Scoring guidelines:
-        - Title: 50-60 chars optimal, must exist
-        - Description: 150-160 chars optimal, must exist
-        - H1: exactly 1 is ideal
-        - Images: all should have alt text
-        - Load time: <3s good, <5s ok, >5s poor
-        - Page size: <3MB good
-        - Must have viewport meta, charset, canonical
-        - OG tags and Twitter cards are important
-        - Internal linking is good for SEO
-        - Word count: >300 words for content pages
-        - Check heading hierarchy
-
-        Severity levels must be exactly one of: "critical", "warning", or "info".
-        Provide 5-15 issues sorted by severity (critical first). Be specific and actionable with recommendations.
-        Extract top 10 keywords by frequency from the page content.`;
-
-        const response = await ai.models.generateContent({
-            model: "gemma-4-31b-it",
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            config: {
-                responseMimeType: "application/json",
-                responseSchema: seoAnalysisSchema,
-            },
-        });
-
-        const analysis = JSON.parse(response.text);
+        const analysis = await analyzeWithOpenRouter(prompt);
+        console.log("SEO analysis succeeded with OpenRouter");
 
         return { success: true, data: analysis };
     } catch (error) {
-        console.error("Gemini analysis error:", error.message);
-        return { success: false, error: error.message };
+        lastError = error;
+        console.error("OpenRouter fallback failed:", error.message);
+
+        return {
+            success: false,
+            error: "AI analysis is temporarily unavailable. Please check the AI provider configuration and try again.",
+        };
     }
 }
